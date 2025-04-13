@@ -1,0 +1,93 @@
+import pandas as pd
+import re
+import unidecode
+import jellyfish
+from rapidfuzz import fuzz, distance
+from tqdm import tqdm
+
+# 示例缩写词典
+ABBR_DICT = {"ltd": "limited", "inc": "incorporated", "co": "company"}
+
+def normalize(name: str) -> str:
+    """对名称进行预处理，去除特殊符号、处理大小写等"""
+    name = unidecode.unidecode(name)  # 去重音符号
+    name = name.lower()  # 转为小写
+    name = re.sub(r"&", " and ", name)
+    name = re.sub(r"[^a-z0-9\s]", " ", name)
+    name = " ".join(name.split())  # 去除多余空格
+    for abbr, full in ABBR_DICT.items():
+        name = re.sub(rf"\b{abbr}\b", full, name)  # 替换缩写
+    return name
+
+def create_blocking_key(df):
+    """创建阻塞键，用于将相似记录分到同一组"""
+    df['norm_name'] = df['NAME'].apply(normalize)  # 标准化名称
+    df["block_key"] = df["norm_name"].apply(
+        lambda x: jellyfish.soundex(x) + "_" + x[0] + "_" + str(len(x)//4)
+    )
+    return df
+
+def generate_candidates(primary_df, alternate_df):
+    """生成候选匹配对"""
+    primary_df = create_blocking_key(primary_df)
+    alternate_df = create_blocking_key(alternate_df)
+    
+    # 合并根据阻塞键生成候选对
+    candidates = pd.merge(primary_df, alternate_df, on='block_key', suffixes=('_left', '_right'))
+    return candidates[['ID_left', 'NAME_left', 'ID_right', 'NAME_right']]
+
+def build_features(a, b):
+    """计算相似度特征"""
+    return {
+        "jw": fuzz.WRatio(a, b, score_cutoff=0)/100,  # Jaro-Winkler 相似度
+        "lev_ratio": 1 - distance.Levenshtein.normalized_distance(a, b),  # Levenshtein 相似度
+        "token_set": fuzz.token_set_ratio(a, b)/100,  # Token set ratio
+        "prefix_match": int(a[:4] == b[:4]),  # 前缀匹配
+        "len_diff": abs(len(a) - len(b)),  # 长度差异
+        "same_soundex": int(jellyfish.soundex(a) == jellyfish.soundex(b))  # Soundex 匹配
+    }
+
+def compute_similarity_features(candidates):
+    """为每个候选对计算相似度特征"""
+    candidates['features'] = candidates.apply(
+        lambda row: build_features(row['NAME_left'], row['NAME_right']), axis=1
+    )
+    return candidates
+
+def match_candidates(candidates):
+    """匹配候选对并计算得分"""
+    candidates['score'] = candidates['features'].apply(
+        lambda x: 0.4 * x['jw'] + 0.4 * x['token_set'] + 0.2 * x['lev_ratio']
+    )
+    candidates['Y/N'] = candidates['score'].apply(lambda x: 'Y' if x >= 0.88 else 'N')
+    return candidates[['ID_left', 'NAME_left', 'ID_right', 'NAME_right', 'Y/N', 'score']]
+
+def process_and_match(primary_file, alternate_file, n_rows=1000):
+    """读取文件并处理前1000条记录"""
+    # 只读取前1000条记录
+    primary_df = pd.read_csv(primary_file).head(n_rows)
+    alternate_df = pd.read_csv(alternate_file).head(n_rows)
+    
+    # Step 1: Generate candidate pairs
+    candidates = generate_candidates(primary_df, alternate_df)
+    
+    # Step 2: Compute similarity features with progress bar
+    tqdm.pandas(desc="Calculating similarity features")
+    candidates_with_features = candidates.progress_apply(
+        lambda row: build_features(row['NAME_left'], row['NAME_right']), axis=1
+    )
+    candidates['features'] = candidates_with_features
+    
+    # Step 3: Apply matching logic
+    results = match_candidates(candidates)
+    
+    return results
+
+# 使用示例
+primary_file = '/mnt/data/primary.csv'
+alternate_file = '/mnt/data/alternate.csv'
+
+# 获取匹配结果，并输出到 CSV 文件
+results = process_and_match(primary_file, alternate_file, n_rows=1000)
+results.to_csv('/mnt/data/matching_results_1000.csv', index=False)
+
